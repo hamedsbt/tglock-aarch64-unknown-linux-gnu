@@ -1,0 +1,144 @@
+name: OpenWrt 25.12 Pi 4
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  openwrt-pi4:
+    name: OpenWrt 25.12 / Raspberry Pi 4 / aarch64-musl
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            zstd
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Download OpenWrt 25.12.4 SDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SDK_VERSION="25.12.4"
+          SDK_URL="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/bcm27xx/bcm2711/openwrt-sdk-${SDK_VERSION}-bcm27xx-bcm2711_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+
+          curl -fL --retry 5 \
+            "$SDK_URL" \
+            -o openwrt-sdk.tar.zst
+
+          mkdir -p "$HOME/openwrt-sdk"
+
+          tar \
+            --use-compress-program=unzstd \
+            -xf openwrt-sdk.tar.zst \
+            -C "$HOME/openwrt-sdk" \
+            --strip-components=1
+
+          echo "OPENWRT_SDK=$HOME/openwrt-sdk" >> "$GITHUB_ENV"
+
+      - name: Locate OpenWrt toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          TOOLCHAIN_BIN="$OPENWRT_SDK/staging_dir/toolchain-aarch64_cortex-a72_gcc-14.3.0_musl/bin"
+
+          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-gcc"
+          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-g++"
+          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-ar"
+          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-ranlib"
+
+          echo "$TOOLCHAIN_BIN" >> "$GITHUB_PATH"
+
+          echo "OPENWRT_TOOLCHAIN_BIN=$TOOLCHAIN_BIN" >> "$GITHUB_ENV"
+
+      - name: Configure Cargo for OpenWrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p .cargo
+
+          cat > .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-openwrt-linux-musl-gcc"
+          ar = "aarch64-openwrt-linux-musl-ar"
+
+          [env]
+          CC_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-gcc"
+          CXX_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-g++"
+          AR_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-ar"
+          RANLIB_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-ranlib"
+          EOF
+
+      - name: Verify OpenWrt toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          aarch64-openwrt-linux-musl-gcc --version
+          aarch64-openwrt-linux-musl-g++ --version
+          aarch64-openwrt-linux-musl-ar --version
+
+      - name: Build tglock CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cargo build \
+            --release \
+            --locked \
+            --no-default-features \
+            --features cli \
+            --bin tglock-cli \
+            --target aarch64-unknown-linux-musl
+
+      - name: Prepare release asset
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp \
+            target/aarch64-unknown-linux-musl/release/tglock-cli \
+            tglock-cli-aarch64_cortex-a72-openwrt25
+
+          chmod +x tglock-cli-aarch64_cortex-a72-openwrt25
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          file tglock-cli-aarch64_cortex-a72-openwrt25
+
+          readelf -h tglock-cli-aarch64_cortex-a72-openwrt25
+
+          readelf -l tglock-cli-aarch64_cortex-a72-openwrt25 \
+            | grep -E 'Requesting program interpreter|interpreter' || true
+
+      - name: Attach binary to GitHub release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: false
+          files: |
+            tglock-cli-aarch64_cortex-a72-openwrt25
