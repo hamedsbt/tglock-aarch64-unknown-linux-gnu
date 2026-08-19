@@ -9,51 +9,80 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Static CLI — aarch64-unknown-linux-musl
+  guard:
+    name: Tag must point to default branch HEAD
     runs-on: ubuntu-22.04
 
     steps:
-      # The workflow repository does not contain the Rust source.
-      # Build directly from the upstream TGLock repository.
-      - name: Checkout TGLock
+      - name: Verify tag is on default branch HEAD
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+
+          branch=$(gh api "repos/$GITHUB_REPOSITORY" -q .default_branch)
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$branch" -q .sha)
+
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME and $branch point to $head — building."
+            exit 0
+          fi
+
+          echo "::error::$GITHUB_REF_NAME points to $GITHUB_SHA, but $branch points to $head."
+          exit 1
+
+  cli:
+    name: Static CLI — aarch64-unknown-linux-musl
+    needs: guard
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          repository: by-sonic/tglock
-          ref: main
-          fetch-depth: 1
+          targets: aarch64-unknown-linux-musl
 
-      - name: Verify source
+      - name: Install cross compilation tools
         run: |
           set -euxo pipefail
 
-          test -f Cargo.toml
-          test -f Cargo.lock
+          sudo apt-get update
 
-          echo "Source:"
-          git remote -v
-          git rev-parse HEAD
+          sudo apt-get install -y \
+            musl-tools \
+            pkg-config \
+            perl \
+            make \
+            gcc \
+            g++ \
+            cmake
 
-          echo "Cargo:"
-          cargo metadata --no-deps --format-version 1 >/dev/null
-
-      - name: Build static aarch64-musl CLI
+      - name: Install cross
         run: |
           set -euxo pipefail
 
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:/home/rust/src" \
-            -w /home/rust/src \
-            ghcr.io/rust-cross/rust-musl-cross:aarch64-musl \
-            cargo build \
-              --release \
-              --locked \
-              --no-default-features \
-              --features cli \
-              --bin tglock-cli \
-              --target aarch64-unknown-linux-musl
+          cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Copy binary
+      - name: Build static CLI
+        env:
+          OPENSSL_STATIC: "1"
+          OPENSSL_VENDORED: "1"
+          OPENSSL_NO_VENDOR: "0"
+        run: |
+          set -euxo pipefail
+
+          cross build \
+            --release \
+            --locked \
+            --no-default-features \
+            --features cli \
+            --bin tglock-cli \
+            --target aarch64-unknown-linux-musl
+
+      - name: Prepare binary
         run: |
           set -euxo pipefail
 
@@ -63,18 +92,7 @@ jobs:
 
           chmod +x tglock-cli-aarch64-unknown-linux-musl
 
-      - name: Strip binary
-        run: |
-          set -euxo pipefail
-
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:/home/rust/src" \
-            -w /home/rust/src \
-            ghcr.io/rust-cross/rust-musl-cross:aarch64-musl \
-            musl-strip \
-            /home/rust/src/tglock-cli-aarch64-unknown-linux-musl
-
-      - name: Verify binary
+      - name: Verify architecture
         run: |
           set -euxo pipefail
 
@@ -83,8 +101,14 @@ jobs:
           echo "=== file ==="
           file "$binary"
 
-          echo "=== ELF header ==="
-          readelf -h "$binary"
+          file "$binary" | grep -E \
+            'ELF 64-bit.*ARM aarch64.*executable'
+
+      - name: Verify static linking
+        run: |
+          set -euxo pipefail
+
+          binary="tglock-cli-aarch64-unknown-linux-musl"
 
           echo "=== program headers ==="
           readelf -l "$binary"
@@ -92,25 +116,59 @@ jobs:
           echo "=== dynamic section ==="
           readelf -d "$binary" || true
 
-          # Must be ARM64 / aarch64.
-          file "$binary" | grep -E \
-            'ELF 64-bit.*ARM aarch64.*executable'
-
-          # Static binary must not have an ELF interpreter.
           if readelf -l "$binary" | grep -q 'INTERP'; then
             echo "::error::Binary is dynamically linked: PT_INTERP found."
             exit 1
           fi
 
-          # Static binary must not require shared libraries.
           if readelf -d "$binary" 2>/dev/null | grep -q 'NEEDED'; then
             echo "::error::Binary has dynamic shared-library dependencies."
             readelf -d "$binary"
             exit 1
           fi
 
+          echo "OK: static aarch64-musl binary."
+
+      - name: Strip binary
+        run: |
+          set -euxo pipefail
+
+          binary="$GITHUB_WORKSPACE/tglock-cli-aarch64-unknown-linux-musl"
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            messense/rust-musl-cross:aarch64-musl \
+            musl-strip \
+            "/work/$(basename "$binary")"
+
+      - name: Final verification
+        run: |
+          set -euxo pipefail
+
+          binary="tglock-cli-aarch64-unknown-linux-musl"
+
+          file "$binary"
+
+          file "$binary" | grep -E \
+            'ELF 64-bit.*ARM aarch64.*executable'
+
+          if readelf -l "$binary" | grep -q 'INTERP'; then
+            echo "::error::Final binary contains PT_INTERP."
+            exit 1
+          fi
+
+          if readelf -d "$binary" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::Final binary has dynamic dependencies."
+            readelf -d "$binary"
+            exit 1
+          fi
+
           echo "========================================"
-          echo "OK: static aarch64-unknown-linux-musl"
+          echo "FINAL BINARY:"
+          echo "  aarch64"
+          echo "  musl"
+          echo "  statically linked"
           echo "========================================"
 
       - name: Upload artifact
@@ -120,11 +178,11 @@ jobs:
           path: tglock-cli-aarch64-unknown-linux-musl
           if-no-files-found: error
 
-      - name: Attach binary to GitHub Release
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          files: tglock-cli-aarch64-unknown-linux-musl
           prerelease: false
+          files: tglock-cli-aarch64-unknown-linux-musl
