@@ -11,7 +11,7 @@ permissions:
 jobs:
   guard:
     name: Tag must point to default branch HEAD
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Verify tag is on default branch HEAD
@@ -27,75 +27,112 @@ jobs:
           fi
 
           echo "::error::$GITHUB_REF_NAME points to $GITHUB_SHA, but $branch points to $head."
-          echo "Move the tag to the current default-branch HEAD and push it again."
           exit 1
 
-  cli-aarch64-musl:
+  cli:
     name: Headless CLI — Linux aarch64 musl
     needs: guard
     runs-on: ubuntu-22.04
-
-    container:
-      image: messense/rust-musl-cross:aarch64-musl
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Build static CLI
-        shell: bash
+      - name: Build static aarch64-musl CLI
         env:
           TARGET: aarch64-unknown-linux-musl
           ASSET: tglock-cli-aarch64-unknown-linux-musl
         run: |
           set -euxo pipefail
 
-          cargo build \
-            --release \
-            --locked \
-            --no-default-features \
-            --features cli \
-            --bin tglock-cli \
-            --target "$TARGET"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/home/rust/src" \
+            -w /home/rust/src \
+            messense/rust-musl-cross:aarch64-musl \
+            cargo build \
+              --release \
+              --locked \
+              --no-default-features \
+              --features cli \
+              --bin tglock-cli \
+              --target "$TARGET"
 
-          cp "target/$TARGET/release/tglock-cli" "$ASSET"
+          cp \
+            "target/$TARGET/release/tglock-cli" \
+            "$ASSET"
+
           chmod +x "$ASSET"
 
-      - name: Verify binary
-        shell: bash
+      - name: Verify ELF architecture and static linking
         env:
-          TARGET: aarch64-unknown-linux-musl
+          ASSET: tglock-cli-aarch64-unknown-linux-musl
+        run: |
+          set -euxo pipefail
+
+          echo "=== file ==="
+          file "$ASSET"
+
+          echo "=== ELF header ==="
+          readelf -h "$ASSET"
+
+          echo "=== program headers ==="
+          readelf -l "$ASSET"
+
+          echo "=== dynamic dependencies ==="
+          readelf -d "$ASSET" || true
+
+          # Must be a 64-bit ARM executable.
+          file "$ASSET" | grep -E \
+            'ELF 64-bit.*ARM aarch64.*executable'
+
+          # A fully static executable must not contain PT_INTERP.
+          if readelf -l "$ASSET" | grep -q 'INTERP'; then
+            echo "::error::Binary is dynamically linked: PT_INTERP exists."
+            exit 1
+          fi
+
+          # A static binary should have no NEEDED shared libraries.
+          if readelf -d "$ASSET" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::Binary has dynamic shared-library dependencies."
+            readelf -d "$ASSET"
+            exit 1
+          fi
+
+          echo "Static aarch64-musl binary verified."
+
+      - name: Strip binary
+        env:
+          ASSET: tglock-cli-aarch64-unknown-linux-musl
+        run: |
+          set -euxo pipefail
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/home/rust/src" \
+            -w /home/rust/src \
+            messense/rust-musl-cross:aarch64-musl \
+            musl-strip "/home/rust/src/$ASSET"
+
+      - name: Verify stripped binary again
+        env:
           ASSET: tglock-cli-aarch64-unknown-linux-musl
         run: |
           set -euxo pipefail
 
           file "$ASSET"
 
-          # Must be an ARM64 ELF executable.
-          file "$ASSET" | grep -E \
-            'ELF 64-bit.*ARM aarch64.*executable'
-
-          # Static musl executable must not have a dynamic ELF interpreter.
           if readelf -l "$ASSET" | grep -q 'INTERP'; then
-            echo "::error::Binary is dynamically linked; PT_INTERP is present."
-            readelf -l "$ASSET"
+            echo "::error::Stripped binary contains PT_INTERP."
             exit 1
           fi
 
-          # Extra sanity check: no shared libraries should be required.
-          if command -v ldd >/dev/null 2>&1; then
-            ldd "$ASSET" || true
+          if readelf -d "$ASSET" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::Stripped binary has dynamic dependencies."
+            exit 1
           fi
 
-          # Make sure the actual CLI binary works.
-          # It cannot execute on the x86_64 GitHub runner, so inspect it
-          # instead of trying to run --version here.
-          readelf -h "$ASSET"
-          readelf -l "$ASSET"
+          echo "Final binary is static."
 
-          echo "Static aarch64-musl CLI verified."
-
-      - name: Upload artifact
+      - name: Upload CI artifact
         uses: actions/upload-artifact@v4
         with:
           name: tglock-cli-aarch64-unknown-linux-musl
