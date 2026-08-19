@@ -15,7 +15,6 @@ jobs:
 
     steps:
       - name: Checkout TGLock
-        # Note: Updated to v4 as v6 does not exist yet (v4 is the current stable)
         uses: actions/checkout@v4
         with:
           repository: by-sonic/tglock
@@ -25,52 +24,11 @@ jobs:
       - name: Verify Cargo project
         run: |
           set -euxo pipefail
-
-          pwd
-          ls -la
-
-          test -f Cargo.toml
-          test -f Cargo.lock
-
-          cargo metadata --no-deps --format-version 1 >/dev/null
-
-      - name: Verify Cargo project
-        run: |
-          set -euxo pipefail
           pwd
           ls -la
           test -f Cargo.toml
           test -f Cargo.lock
           cargo metadata --no-deps --format-version 1 >/dev/null
-
-      # 👇 ADD THIS NEW STEP HERE 👇
-      - name: Update Cargo.lock for vendored native-tls
-        run: |
-          set -euxo pipefail
-          # This updates the runner's local Cargo.lock to match the new Cargo.toml features
-          cargo update -p native-tls
-
-      - name: Build static CLI
-        run: |
-          set -euxo pipefail
-
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:/home/rust/src" \
-            -w /home/rust/src \
-            -e OPENSSL_STATIC=1 \
-            -e PKG_CONFIG_ALLOW_CROSS=1 \
-            ghcr.io/rust-cross/rust-musl-cross:aarch64-musl \
-            bash -lc '
-              set -euxo pipefail
-              export PATH="/usr/local/musl/bin:$PATH"
-              cargo build \
-                --release \
-                --locked \
-                --no-default-features \
-                --features cli \
-                --bin tglock-cli \
-                --target aarch64-unknown-linux-musl
-            '
 
       - name: Build static CLI
         run: |
@@ -86,6 +44,10 @@ jobs:
               set -euxo pipefail
 
               export PATH="/usr/local/musl/bin:$PATH"
+
+              # Force update the lockfile inside the container to match Cargo.toml
+              echo "Updating Cargo.lock to ensure vendored feature is active..."
+              cargo update -p native-tls
 
               cargo build \
                 --release \
