@@ -30,120 +30,133 @@ jobs:
           exit 1
 
   cli:
-    name: Headless CLI — Linux aarch64 musl
+    name: Static CLI — aarch64-unknown-linux-musl
     needs: guard
     runs-on: ubuntu-22.04
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+    container:
+      image: messense/rust-musl-cross:aarch64-musl
 
-      - name: Build static aarch64-musl CLI
-        env:
-          TARGET: aarch64-unknown-linux-musl
-          ASSET: tglock-cli-aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          path: src
+
+      - name: Show workspace
+        run: |
+          set -eux
+
+          pwd
+          ls -la
+          ls -la src
+          test -f src/Cargo.toml
+
+      - name: Build static CLI
+        working-directory: src
         run: |
           set -euxo pipefail
 
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/home/rust/src" \
-            -w /home/rust/src \
-            messense/rust-musl-cross:aarch64-musl \
-            cargo build \
-              --release \
-              --locked \
-              --no-default-features \
-              --features cli \
-              --bin tglock-cli \
-              --target "$TARGET"
+          cargo build \
+            --release \
+            --locked \
+            --no-default-features \
+            --features cli \
+            --bin tglock-cli
+
+      - name: Prepare release binary
+        working-directory: src
+        run: |
+          set -euxo pipefail
 
           cp \
-            "target/$TARGET/release/tglock-cli" \
-            "$ASSET"
+            target/aarch64-unknown-linux-musl/release/tglock-cli \
+            ../tglock-cli-aarch64-unknown-linux-musl
 
-          chmod +x "$ASSET"
+          chmod +x ../tglock-cli-aarch64-unknown-linux-musl
 
-      - name: Verify ELF architecture and static linking
-        env:
-          ASSET: tglock-cli-aarch64-unknown-linux-musl
+      - name: Verify architecture
+        working-directory: src
         run: |
           set -euxo pipefail
 
-          echo "=== file ==="
-          file "$ASSET"
+          file ../tglock-cli-aarch64-unknown-linux-musl
+
+          file ../tglock-cli-aarch64-unknown-linux-musl | \
+            grep -E 'ELF 64-bit.*ARM aarch64.*executable'
+
+      - name: Verify static linking
+        working-directory: src
+        run: |
+          set -euxo pipefail
+
+          binary="../tglock-cli-aarch64-unknown-linux-musl"
 
           echo "=== ELF header ==="
-          readelf -h "$ASSET"
+          readelf -h "$binary"
 
-          echo "=== program headers ==="
-          readelf -l "$ASSET"
+          echo "=== Program headers ==="
+          readelf -l "$binary"
 
-          echo "=== dynamic dependencies ==="
-          readelf -d "$ASSET" || true
+          echo "=== Dynamic section ==="
+          readelf -d "$binary" || true
 
-          # Must be a 64-bit ARM executable.
-          file "$ASSET" | grep -E \
-            'ELF 64-bit.*ARM aarch64.*executable'
-
-          # A fully static executable must not contain PT_INTERP.
-          if readelf -l "$ASSET" | grep -q 'INTERP'; then
-            echo "::error::Binary is dynamically linked: PT_INTERP exists."
+          # Static executable must not have an ELF interpreter.
+          if readelf -l "$binary" | grep -q 'INTERP'; then
+            echo "::error::Binary is dynamically linked: PT_INTERP found."
             exit 1
           fi
 
-          # A static binary should have no NEEDED shared libraries.
-          if readelf -d "$ASSET" 2>/dev/null | grep -q 'NEEDED'; then
+          # Static executable must not depend on shared libraries.
+          if readelf -d "$binary" 2>/dev/null | grep -q 'NEEDED'; then
             echo "::error::Binary has dynamic shared-library dependencies."
-            readelf -d "$ASSET"
+            readelf -d "$binary"
             exit 1
           fi
 
-          echo "Static aarch64-musl binary verified."
+          echo "OK: static aarch64-musl executable."
 
       - name: Strip binary
-        env:
-          ASSET: tglock-cli-aarch64-unknown-linux-musl
+        working-directory: src
         run: |
           set -euxo pipefail
 
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/home/rust/src" \
-            -w /home/rust/src \
-            messense/rust-musl-cross:aarch64-musl \
-            musl-strip "/home/rust/src/$ASSET"
+          musl-strip \
+            ../tglock-cli-aarch64-unknown-linux-musl
 
-      - name: Verify stripped binary again
-        env:
-          ASSET: tglock-cli-aarch64-unknown-linux-musl
+      - name: Final verification
+        working-directory: src
         run: |
           set -euxo pipefail
 
-          file "$ASSET"
+          binary="../tglock-cli-aarch64-unknown-linux-musl"
 
-          if readelf -l "$ASSET" | grep -q 'INTERP'; then
-            echo "::error::Stripped binary contains PT_INTERP."
+          file "$binary"
+
+          if readelf -l "$binary" | grep -q 'INTERP'; then
+            echo "::error::Final binary contains PT_INTERP."
             exit 1
           fi
 
-          if readelf -d "$ASSET" 2>/dev/null | grep -q 'NEEDED'; then
-            echo "::error::Stripped binary has dynamic dependencies."
+          if readelf -d "$binary" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::Final binary has shared-library dependencies."
             exit 1
           fi
 
-          echo "Final binary is static."
+          echo "Final binary is STATIC."
 
-      - name: Upload CI artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: tglock-cli-aarch64-unknown-linux-musl
-          path: tglock-cli-aarch64-unknown-linux-musl
+          path: src/tglock-cli-aarch64-unknown-linux-musl
           if-no-files-found: error
 
-      - name: Attach binary to GitHub Release
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: false
-          files: tglock-cli-aarch64-unknown-linux-musl
+          files: src/tglock-cli-aarch64-unknown-linux-musl
