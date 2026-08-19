@@ -1,4 +1,4 @@
-name: OpenWrt 25.12 Pi 4
+name: Release
 
 on:
   workflow_dispatch:
@@ -9,96 +9,44 @@ permissions:
   contents: write
 
 jobs:
-  openwrt-pi4:
-    name: OpenWrt 25.12 / Raspberry Pi 4 / aarch64-musl
+  guard:
+    name: Tag must point to default branch HEAD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify tag is on default branch HEAD
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch=$(gh api "repos/$GITHUB_REPOSITORY" -q .default_branch)
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$branch" -q .sha)
+
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME and $branch point to $head — building."
+            exit 0
+          fi
+
+          echo "::error::$GITHUB_REF_NAME points to $GITHUB_SHA, but $branch points to $head."
+          echo "Move the tag to the current default-branch HEAD and push it again."
+          exit 1
+
+  cli-aarch64-musl:
+    name: Headless CLI — Linux aarch64 musl
+    needs: guard
     runs-on: ubuntu-22.04
+
+    container:
+      image: messense/rust-musl-cross:aarch64-musl
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            curl \
-            file \
-            zstd
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-
-      - name: Download OpenWrt 25.12.4 SDK
+      - name: Build static CLI
         shell: bash
-        run: |
-          set -euxo pipefail
-
-          SDK_VERSION="25.12.4"
-          SDK_URL="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/bcm27xx/bcm2711/openwrt-sdk-${SDK_VERSION}-bcm27xx-bcm2711_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
-
-          curl -fL --retry 5 \
-            "$SDK_URL" \
-            -o openwrt-sdk.tar.zst
-
-          mkdir -p "$HOME/openwrt-sdk"
-
-          tar \
-            --use-compress-program=unzstd \
-            -xf openwrt-sdk.tar.zst \
-            -C "$HOME/openwrt-sdk" \
-            --strip-components=1
-
-          echo "OPENWRT_SDK=$HOME/openwrt-sdk" >> "$GITHUB_ENV"
-
-      - name: Locate OpenWrt toolchain
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          TOOLCHAIN_BIN="$OPENWRT_SDK/staging_dir/toolchain-aarch64_cortex-a72_gcc-14.3.0_musl/bin"
-
-          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-gcc"
-          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-g++"
-          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-ar"
-          test -x "$TOOLCHAIN_BIN/aarch64-openwrt-linux-musl-ranlib"
-
-          echo "$TOOLCHAIN_BIN" >> "$GITHUB_PATH"
-
-          echo "OPENWRT_TOOLCHAIN_BIN=$TOOLCHAIN_BIN" >> "$GITHUB_ENV"
-
-      - name: Configure Cargo for OpenWrt
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          mkdir -p .cargo
-
-          cat > .cargo/config.toml <<'EOF'
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-openwrt-linux-musl-gcc"
-          ar = "aarch64-openwrt-linux-musl-ar"
-
-          [env]
-          CC_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-gcc"
-          CXX_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-g++"
-          AR_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-ar"
-          RANLIB_aarch64_unknown_linux_musl = "aarch64-openwrt-linux-musl-ranlib"
-          EOF
-
-      - name: Verify OpenWrt toolchain
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          aarch64-openwrt-linux-musl-gcc --version
-          aarch64-openwrt-linux-musl-g++ --version
-          aarch64-openwrt-linux-musl-ar --version
-
-      - name: Build tglock CLI
-        shell: bash
+        env:
+          TARGET: aarch64-unknown-linux-musl
+          ASSET: tglock-cli-aarch64-unknown-linux-musl
         run: |
           set -euxo pipefail
 
@@ -108,37 +56,57 @@ jobs:
             --no-default-features \
             --features cli \
             --bin tglock-cli \
-            --target aarch64-unknown-linux-musl
+            --target "$TARGET"
 
-      - name: Prepare release asset
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          cp \
-            target/aarch64-unknown-linux-musl/release/tglock-cli \
-            tglock-cli-aarch64_cortex-a72-openwrt25
-
-          chmod +x tglock-cli-aarch64_cortex-a72-openwrt25
+          cp "target/$TARGET/release/tglock-cli" "$ASSET"
+          chmod +x "$ASSET"
 
       - name: Verify binary
         shell: bash
+        env:
+          TARGET: aarch64-unknown-linux-musl
+          ASSET: tglock-cli-aarch64-unknown-linux-musl
         run: |
           set -euxo pipefail
 
-          file tglock-cli-aarch64_cortex-a72-openwrt25
+          file "$ASSET"
 
-          readelf -h tglock-cli-aarch64_cortex-a72-openwrt25
+          # Must be an ARM64 ELF executable.
+          file "$ASSET" | grep -E \
+            'ELF 64-bit.*ARM aarch64.*executable'
 
-          readelf -l tglock-cli-aarch64_cortex-a72-openwrt25 \
-            | grep -E 'Requesting program interpreter|interpreter' || true
+          # Static musl executable must not have a dynamic ELF interpreter.
+          if readelf -l "$ASSET" | grep -q 'INTERP'; then
+            echo "::error::Binary is dynamically linked; PT_INTERP is present."
+            readelf -l "$ASSET"
+            exit 1
+          fi
 
-      - name: Attach binary to GitHub release
+          # Extra sanity check: no shared libraries should be required.
+          if command -v ldd >/dev/null 2>&1; then
+            ldd "$ASSET" || true
+          fi
+
+          # Make sure the actual CLI binary works.
+          # It cannot execute on the x86_64 GitHub runner, so inspect it
+          # instead of trying to run --version here.
+          readelf -h "$ASSET"
+          readelf -l "$ASSET"
+
+          echo "Static aarch64-musl CLI verified."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tglock-cli-aarch64-unknown-linux-musl
+          path: tglock-cli-aarch64-unknown-linux-musl
+          if-no-files-found: error
+
+      - name: Attach binary to GitHub Release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: false
-          files: |
-            tglock-cli-aarch64_cortex-a72-openwrt25
+          files: tglock-cli-aarch64-unknown-linux-musl
