@@ -53,7 +53,7 @@ jobs:
                 --release \
                 --locked \
                 --no-default-features \
-                --features cli,openssl/vendored \
+                --features cli \
                 --bin tglock-cli \
                 --target aarch64-unknown-linux-musl
             '
